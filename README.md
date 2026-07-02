@@ -1,9 +1,6 @@
 Python Dependencies
 -------------------
-pip install ultralytics
-pip install opencv-python
-pip install numpy
-pip install mss
+pip install requirements
 
 YOLO Model
 ----------
