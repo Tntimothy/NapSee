@@ -50,10 +50,14 @@ import time
 import threading
 
 from ultralytics import YOLO
+from pathlib import Path
 
 # CONFIG
 
-MODEL_NAME = "yolov8m-pose.pt"
+PROJECT_DIR = Path(__file__).resolve().parent
+#DETECTOR_MODEL = PROJECT_DIR / "secondrun" / "visdrone_person" / "weights" / "best.pt"
+DETECTOR_MODEL = PROJECT_DIR / "yolov8m.pt"
+POSE_MODEL = PROJECT_DIR / "yolov8n-pose.pt"
 CONFIDENCE = 0.12
 BODY_ANGLE_THRESHOLD = 70
 MOVEMENT_THRESHOLD = 80
@@ -63,14 +67,14 @@ MIN_AREA = 50
 OCCUPANCY_THRESHOLD = 350
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
-TILE_ROWS = 2
-TILE_COLS = 2
+TILE_ROWS = 1
+TILE_COLS = 1
 WINDOW_NAME = "NapSee Window Capture"
 
 # PERFORMANCE CONFIG
 
 # I will try to edit this for actual cctvs
-TILE_IMGSZ = 640 
+TILE_IMGSZ = 640
 TARGET_FPS = 5 
 MATCH_DIST = 100
 
@@ -236,17 +240,16 @@ shared_frame = blank
 
 
 def detection_loop():
-    """
-    Runs on a background thread. Captures, tiles, runs YOLO, scores, tracks,
-    and draws onto a frame, then hands the finished frame to the main thread
-    through shared_frame. Never touches the cv2 window directly.
-    """
 
     global shared_frame
 
-    model = YOLO(MODEL_NAME)
+    detector = YOLO(str(DETECTOR_MODEL))
+    pose_model = YOLO(str(POSE_MODEL))
 
-    people  = {}
+    detector.to("cpu")
+    pose_model.to("cpu")
+
+    people = {}
     next_id = 1
 
     while not stop_event.is_set():
@@ -276,12 +279,12 @@ def detection_loop():
 
         current_time = time.time()
 
-        all_results = []
-
         h, w = frame.shape[:2]
 
         tile_w = w // TILE_COLS
         tile_h = h // TILE_ROWS
+
+        detections = []
 
         try:
 
@@ -297,181 +300,307 @@ def detection_loop():
                         x_offset:x_offset + tile_w
                     ]
 
-                    tile_results = model.predict(
+                    results = detector.predict(
                         tile,
-                        conf=CONFIDENCE,
                         imgsz=TILE_IMGSZ,
+                        conf=CONFIDENCE,
+                        device="cpu",
                         verbose=False
                     )
 
-                    all_results.append((tile_results, x_offset, y_offset))
+                    for result in results:
+
+                        if result.boxes is None:
+                            continue
+
+                        for box in result.boxes:
+
+                            cls = int(box.cls[0])
+
+                            if cls not in (0, 1):
+                                continue
+
+                            if float(box.conf[0]) < CONFIDENCE:
+                                continue
+
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                            x1 += x_offset
+                            x2 += x_offset
+                            y1 += y_offset
+                            y2 += y_offset
+
+                            pw = x2 - x1
+                            ph = y2 - y1
+
+                            if pw * ph < MIN_AREA:
+                                continue
+
+                            detections.append({
+                                "box": (x1, y1, x2, y2),
+                                "width": pw,
+                                "height": ph
+                            })
 
         except Exception as e:
             print(f"Inference error: {e}")
             time.sleep(0.1)
             continue
 
-        n_people   = 0
+        n_people = 0
         n_suspects = 0
 
-        for tile_results, x_offset, y_offset in all_results:
+        for detection in detections:
 
-            for result in tile_results:
+            x1, y1, x2, y2 = detection["box"]
 
-                if result.boxes is None or result.keypoints is None:
-                    continue
+            pw = detection["width"]
+            ph = detection["height"]
 
-                boxes     = result.boxes
-                keypoints = result.keypoints.xy.cpu().numpy()
+            n_people += 1
 
-                for i, box in enumerate(boxes):
+            pad = 30
 
-                    if int(box.cls[0]) != 0:
-                        continue
+            crop_x1 = max(0, x1 - pad)
+            crop_y1 = max(0, y1 - pad)
+            crop_x2 = min(w, x2 + pad)
+            crop_y2 = min(h, y2 + pad)
 
-                    if float(box.conf[0]) < CONFIDENCE:
-                        continue
+            crop = frame[
+                crop_y1:crop_y2,
+                crop_x1:crop_x2
+            ]
 
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+            kp = None
 
-                    x1 += x_offset
-                    x2 += x_offset
-                    y1 += y_offset
-                    y2 += y_offset
+            try:
 
-                    pw = x2 - x1
-                    ph = y2 - y1
+                pose_results = pose_model.predict(
+                    crop,
+                    imgsz=512,
+                    conf=0.25,
+                    device="cpu",
+                    verbose=False
+                )
 
-                    if pw * ph < MIN_AREA:
-                        continue
+                if (
+                    len(pose_results)
+                    and pose_results[0].keypoints is not None
+                    and len(pose_results[0].keypoints.xy)
+                ):
 
-                    n_people += 1
+                    kp = pose_results[0].keypoints.xy.cpu().numpy()[0]
 
-                    ratio           = pw / max(ph, 1)
-                    occupancy_score = ratio * pw
-                    cx              = (x1 + x2) // 2
-                    cy              = (y1 + y2) // 2
+                    kp[:, 0] += crop_x1
+                    kp[:, 1] += crop_y1
 
-                    kp = keypoints[i].copy()
-                    kp[:, 0] += x_offset
-                    kp[:, 1] += y_offset
+            except Exception:
+                kp = None
 
-                    person_id = None
-                    best_dist = MATCH_DIST
+            ratio = pw / max(ph, 1)
+            occupancy_score = ratio * pw
 
-                    for pid, pdata in people.items():
-                        px, py = pdata["center"]
-                        dist = np.sqrt((cx - px) ** 2 + (cy - py) ** 2)
-                        if dist < best_dist:
-                            best_dist = dist
-                            person_id = pid
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
 
-                    if person_id is None:
-                        person_id = next_id
-                        next_id  += 1
-                        people[person_id] = {
-                            "center":     (cx, cy),
-                            "start_time": None,
-                            "last_seen":  current_time,
-                        }
+            person_id = None
+            best_dist = MATCH_DIST
 
-                    pdata        = people[person_id]
-                    old_x, old_y = pdata["center"]
-                    movement     = np.sqrt((cx - old_x) ** 2 + (cy - old_y) ** 2)
-                    pdata["center"]    = (cx, cy)
-                    pdata["last_seen"] = current_time
+            for pid, pdata in people.items():
 
-                    angle            = 90
-                    horizontal_score = 0
+                px, py = pdata["center"]
 
-                    try:
+                dist = np.sqrt(
+                    (cx - px) ** 2 +
+                    (cy - py) ** 2
+                )
 
-                        sx = (kp[5][0]  + kp[6][0])  / 2
-                        sy = (kp[5][1]  + kp[6][1])  / 2
-                        hx = (kp[11][0] + kp[12][0]) / 2
-                        hy = (kp[11][1] + kp[12][1]) / 2
+                if dist < best_dist:
+                    best_dist = dist
+                    person_id = pid
 
-                        angle = abs(np.degrees(np.arctan2(hy - sy, hx - sx)))
+            if person_id is None:
 
-                        if angle < BODY_ANGLE_THRESHOLD:
-                            horizontal_score += 3
+                person_id = next_id
+                next_id += 1
 
-                        if ratio > 1.2:
-                            horizontal_score += 2
+                people[person_id] = {
+                    "center": (cx, cy),
+                    "start_time": None,
+                    "last_seen": current_time,
+                }
 
-                        if movement < MOVEMENT_THRESHOLD:
-                            horizontal_score += 1
+            pdata = people[person_id]
 
-                        if occupancy_score > OCCUPANCY_THRESHOLD:
-                            horizontal_score += 2
+            old_x, old_y = pdata["center"]
 
-                    except Exception as e:
-                        print(f"Pose scoring error: {e}")
+            movement = np.sqrt(
+                (cx - old_x) ** 2 +
+                (cy - old_y) ** 2
+            )
 
-                    lying = horizontal_score >= 4
+            pdata["center"] = (cx, cy)
+            pdata["last_seen"] = current_time
 
-                    if lying:
+            angle = 90
+            horizontal_score = 0
 
-                        if pdata["start_time"] is None:
-                            pdata["start_time"] = current_time
+            if kp is not None:
 
-                        elapsed = current_time - pdata["start_time"]
+                try:
 
-                        if elapsed >= SLEEP_TIME:
-                            status = "BENCH MISUSE"
-                            color  = (0, 255, 0)
-                        elif elapsed >= POSSIBLE_SLEEP_TIME:
-                            status = "POSSIBLE"
-                            color  = (0, 255, 255)
-                        else:
-                            status = "LYING"
-                            color  = (255, 255, 0)
+                    sx = (kp[5][0] + kp[6][0]) / 2
+                    sy = (kp[5][1] + kp[6][1]) / 2
 
-                    else:
+                    hx = (kp[11][0] + kp[12][0]) / 2
+                    hy = (kp[11][1] + kp[12][1]) / 2
 
-                        pdata["start_time"] = None
-                        elapsed = 0
-                        status  = "PERSON"
-                        color   = (100, 100, 100)
-
-                    thickness = 1 if status == "PERSON" else 2
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-
-                    if status == "PERSON":
-                        continue
-
-                    n_suspects += 1
-
-                    for x, y in kp:
-                        if x > 0 and y > 0:
-                            cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 255), -1)
-
-                    for p1, p2 in SKELETON:
-                        x1s, y1s = kp[p1]
-                        x2s, y2s = kp[p2]
-                        if x1s > 0 and y1s > 0 and x2s > 0 and y2s > 0:
-                            cv2.line(
-                                frame,
-                                (int(x1s), int(y1s)),
-                                (int(x2s), int(y2s)),
-                                (255, 255, 0),
-                                2,
+                    angle = abs(
+                        np.degrees(
+                            np.arctan2(
+                                hy - sy,
+                                hx - sx
                             )
+                        )
+                    )
 
-                    cv2.putText(frame, f"ID:{person_id}  {status}",
-                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    if angle < BODY_ANGLE_THRESHOLD:
+                        horizontal_score += 3
 
-                    cv2.putText(frame, f"A:{angle:.0f}",
-                        (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                except Exception:
+                    pass
 
-                    cv2.putText(frame, f"S:{horizontal_score}",
-                        (x1, y2 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            if ratio > 1.2:
+                horizontal_score += 2
 
-                    cv2.putText(frame, f"O:{occupancy_score:.0f}",
-                        (x1, y2 + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            if movement < MOVEMENT_THRESHOLD:
+                horizontal_score += 1
 
-                    cv2.putText(frame, f"T:{elapsed:.1f}s",
-                        (x1, y2 + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            if occupancy_score > OCCUPANCY_THRESHOLD:
+                horizontal_score += 2
+
+            lying = horizontal_score >= 4
+
+            if lying:
+
+                if pdata["start_time"] is None:
+                    pdata["start_time"] = current_time
+
+                elapsed = current_time - pdata["start_time"]
+
+                if elapsed >= SLEEP_TIME:
+                    status = "BENCH MISUSE"
+                    color = (0, 255, 0)
+
+                elif elapsed >= POSSIBLE_SLEEP_TIME:
+                    status = "POSSIBLE"
+                    color = (0, 255, 255)
+
+                else:
+                    status = "LYING"
+                    color = (255, 255, 0)
+
+            else:
+
+                pdata["start_time"] = None
+                elapsed = 0
+                status = "PERSON"
+                color = (100, 100, 100)
+
+            thickness = 1 if status == "PERSON" else 2
+
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                color,
+                thickness
+            )
+
+            if status != "PERSON":
+                n_suspects += 1
+
+            if kp is not None:
+
+                for x, y in kp:
+
+                    if x > 0 and y > 0:
+                        cv2.circle(
+                            frame,
+                            (int(x), int(y)),
+                            3,
+                            (0, 255, 255),
+                            -1
+                        )
+
+                for p1, p2 in SKELETON:
+
+                    x1s, y1s = kp[p1]
+                    x2s, y2s = kp[p2]
+
+                    if (
+                        x1s > 0 and
+                        y1s > 0 and
+                        x2s > 0 and
+                        y2s > 0
+                    ):
+                        cv2.line(
+                            frame,
+                            (int(x1s), int(y1s)),
+                            (int(x2s), int(y2s)),
+                            (255, 255, 0),
+                            2
+                        )
+
+            cv2.putText(
+                frame,
+                f"ID:{person_id} {status}",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                color,
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"A:{angle:.0f}",
+                (x1, y2 + 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1
+            )
+
+            cv2.putText(
+                frame,
+                f"S:{horizontal_score}",
+                (x1, y2 + 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1
+            )
+
+            cv2.putText(
+                frame,
+                f"O:{occupancy_score:.0f}",
+                (x1, y2 + 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1
+            )
+
+            cv2.putText(
+                frame,
+                f"T:{elapsed:.1f}s",
+                (x1, y2 + 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1
+            )
 
         cv2.putText(
             frame,
@@ -483,23 +612,25 @@ def detection_loop():
             2,
         )
 
-        remove_ids = [
-            pid for pid, pdata in people.items()
-            if current_time - pdata["last_seen"] > 3
-        ]
+        remove_ids = []
+
+        for pid, pdata in people.items():
+
+            if current_time - pdata["last_seen"] > 3:
+                remove_ids.append(pid)
 
         for pid in remove_ids:
             del people[pid]
 
         with frame_lock:
-            shared_frame = frame
+            shared_frame = frame.copy()
 
-        spent     = time.time() - frame_start
+        spent = time.time() - frame_start
+
         remaining = (1.0 / TARGET_FPS) - spent
 
         if remaining > 0:
             time.sleep(remaining)
-
 
 # MAIN LOOP
 
