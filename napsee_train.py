@@ -1,6 +1,6 @@
 from ultralytics import YOLO
 
-model = YOLO("yolov8n.pt")
+model = YOLO("yolov8m.pt")
 
 results = model.train(
     data="VisDrone.yaml",
@@ -9,8 +9,8 @@ results = model.train(
     batch=4,
     device="cpu",
     workers=4,
-    classes=[0, 1],
-    project=r"F:\Github\NapSee\secondrun",
+    classes=[0],
+    project=r"F:\Github\NapSee\thirdrun",
     name="visdrone_person",
     exist_ok=True,
     verbose=True,
@@ -18,6 +18,6 @@ results = model.train(
     save=True,
     save_period=5,
     val=True,
-    patience=20,
+    patience=10,
     cache=True
 )

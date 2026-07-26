@@ -55,7 +55,7 @@ from pathlib import Path
 # CONFIG
 
 PROJECT_DIR = Path(__file__).resolve().parent
-#DETECTOR_MODEL = PROJECT_DIR / "secondrun" / "visdrone_person" / "weights" / "best.pt"
+#DETECTOR_MODEL = PROJECT_DIR / "thirdrun" / "visdrone_person" / "weights" / "best.pt"
 DETECTOR_MODEL = PROJECT_DIR / "yolov8m.pt"
 POSE_MODEL = PROJECT_DIR / "yolov8n-pose.pt"
 CONFIDENCE = 0.12

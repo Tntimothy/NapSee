@@ -17,7 +17,7 @@ test: images/test # test-dev images (optional) 1610 images
 # Classes
 names:
   0: pedestrian
-  1: people
+  0: people
   2: bicycle
   3: car
   4: van
