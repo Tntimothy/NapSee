@@ -64,7 +64,7 @@ MOVEMENT_THRESHOLD = 80
 POSSIBLE_SLEEP_TIME = 3
 SLEEP_TIME = 6
 MIN_AREA = 50
-OCCUPANCY_THRESHOLD = 350
+OCCUPANCY_THRESHOLD = 150
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
 TILE_ROWS = 1
@@ -73,9 +73,8 @@ WINDOW_NAME = "NapSee Window Capture"
 
 # PERFORMANCE CONFIG
 
-# I will try to edit this for actual cctvs
 TILE_IMGSZ = 640
-TARGET_FPS = 5 
+TARGET_FPS = 5
 MATCH_DIST = 100
 
 # SKELETON
@@ -359,7 +358,7 @@ def detection_loop():
 
             n_people += 1
 
-            pad = 30
+            pad = max(80, max(pw, ph))
 
             crop_x1 = max(0, x1 - pad)
             crop_y1 = max(0, y1 - pad)
@@ -507,18 +506,18 @@ def detection_loop():
                 status = "PERSON"
                 color = (100, 100, 100)
 
-            thickness = 1 if status == "PERSON" else 2
+            if status == "PERSON":
+                continue
+
+            n_suspects += 1
 
             cv2.rectangle(
                 frame,
                 (x1, y1),
                 (x2, y2),
                 color,
-                thickness
+                2
             )
-
-            if status != "PERSON":
-                n_suspects += 1
 
             if kp is not None:
 
